@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+#
+# gsync — стянуть свежее из удалённого репозитория, безопасно.
+#
+# Зачем не просто `git pull`. Pull в чистом виде делает разное в
+# зависимости от состояния репозитория и настроек, и в трёх случаях из
+# пяти это не то, что нужно человеку, севшему за другую машину:
+# незакоммиченные правки он может смешать со стянутыми, при разошедшихся
+# ветках — создать merge-коммит на ровном месте. Этот скрипт сначала
+# СМОТРИТ, потом действует, и делает только заведомо безопасное —
+# перемотку вперёд. Всё остальное он называет словами и предлагает
+# команду, но выполняет её человек.
+#
+# Что делает НИКОГДА: не коммитит, не откатывает, не прячет в stash, не
+# сливает ветки, не переписывает историю, не трогает удалённый
+# репозиторий. Максимум разрушительности — `git merge --ff-only`, то
+# есть сдвиг указателя ветки вперёд, когда своих коммитов нет вовсе.
+#
+# Использование:
+#     gsync                     текущий репозиторий
+#     gsync ПУТЬ                репозиторий по пути
+#     gsync ПУТЬ-С-РЕПАМИ       все репозитории внутри каталога
+#     gsync -n | --dry-run      только показать состояние, ничего не менять
+#     gsync --install           установить себя в ~/.local/bin
+#     gsync -h | --help
+#
+# Код возврата: 0 — всё в порядке либо перемотано; 1 — хоть один
+# репозиторий требует внимания.
+
+set -u
+
+# --- Оформление ------------------------------------------------------------
+#
+# Цвет только для терминала: вывод кладут в файл и пересылают, а
+# escape-последовательности уехали бы туда же.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'
+    C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+    C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_OFF=''
+fi
+
+DRY_RUN=0
+TARGETS=()
+NEED_ATTENTION=0
+TOTAL=0
+
+usage() {
+    cat <<'EOF'
+gsync — стянуть свежее из удалённого репозитория, безопасно.
+
+    gsync                  текущий репозиторий
+    gsync ПУТЬ             репозиторий по пути
+    gsync ПУТЬ-С-РЕПАМИ    все репозитории внутри каталога
+    gsync -n, --dry-run    только показать состояние
+    gsync --install        установить себя в ~/.local/bin
+    gsync -h, --help       эта справка
+
+Скрипт делает только перемотку вперёд (git merge --ff-only) и только
+когда своих коммитов нет. Всё остальное — называет словами и предлагает
+команду; выполняете её вы.
+EOF
+}
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '  %s⚠%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
+err()  { printf '  %s✗%s %s\n' "$C_ERR" "$C_OFF" "$*"; }
+# Отступ ставится КАЖДОЙ строке: подсказка бывает многострочной (вывод
+# git при отказе), и без этого вторая строка прилипает к левому краю и
+# читается как отдельное сообщение.
+hint() {
+    printf '%s\n' "$*" | while IFS= read -r line; do
+        printf '    %s%s%s\n' "$C_DIM" "$line" "$C_OFF"
+    done
+}
+
+# --- Установка -------------------------------------------------------------
+#
+# Скрипт ставит себя сам, и это не удобство ради удобства. Инструкция
+# «mv ~/Downloads/gsync ~/.local/bin/gsync» однажды уже сломалась: у mv
+# есть свойство класть файл ВНУТРЬ назначения, если назначение —
+# существующий каталог. Получился ~/.local/bin/gsync/gsync, поиск по
+# PATH упёрся в каталог, и zsh сказал «permission denied» — сообщение,
+# по которому причину не угадать. Здесь этот случай разбирается явно и
+# называется словами.
+
+install_self() {
+    local src target target_dir
+    src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    target_dir="$HOME/.local/bin"
+    target="$target_dir/gsync"
+
+    say "Установка gsync"
+    say ""
+
+    mkdir -p "$target_dir" || return 1
+
+    # Главная ловушка: на месте файла оказался каталог. Сами его НЕ
+    # удаляем — внутрь могло уехать чужое, и удалять вслепую нельзя.
+    if [ -d "$target" ]; then
+        err "по пути $target лежит КАТАЛОГ, а должен файл"
+        hint "именно из-за него оболочка говорит «permission denied»:"
+        hint "поиск по PATH находит каталог и пытается его выполнить."
+        hint ""
+        hint "посмотрите, что внутри, и заберите своё:"
+        hint "  ls -la \"$target\""
+        hint "затем уберите пустой каталог и повторите установку:"
+        hint "  rmdir \"$target\" && bash \"$src\" --install"
+        hint ""
+        hint "rmdir, а не rm -rf: он ОТКАЖЕТСЯ удалять непустой каталог,"
+        hint "и это здесь защита, а не неудобство."
+        return 1
+    fi
+
+    if [ "$src" = "$target" ]; then
+        ok "уже на месте: $target"
+    else
+        [ -f "$target" ] && warn "перезаписываю прежнюю версию"
+        cp -- "$src" "$target" || { err "не удалось скопировать"; return 1; }
+        ok "скопирован в $target"
+    fi
+
+    # 755, а не +x: у скачанного файла права бывают 666 или 777, и
+    # всемирно доступный на запись исполняемый файл в PATH — это то,
+    # что правит кто угодно, а запускаете вы.
+    chmod 755 "$target" || { err "не удалось выставить права"; return 1; }
+    ok "права 755"
+
+    # Описание едет рядом, если лежит рядом с исходником: второй ручной
+    # mv — это второй шанс повторить ту же ошибку.
+    local doc="${src%/*}/gsync.md"
+    if [ -f "$doc" ] && [ "$doc" != "$target_dir/gsync.md" ]; then
+        cp -- "$doc" "$target_dir/gsync.md" && ok "описание рядом: $target_dir/gsync.md"
+    fi
+
+    say ""
+    case ":$PATH:" in
+        *":$target_dir:"*)
+            ok "каталог уже в PATH — можно запускать: gsync --help"
+            ;;
+        *)
+            warn "$target_dir отсутствует в PATH"
+            local rc="$HOME/.zshrc"
+            case "${SHELL:-}" in *bash) rc="$HOME/.bashrc" ;; esac
+            hint "добавьте строку в $rc (файл я НЕ правлю сам):"
+            hint "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            hint "затем: source $rc"
+            ;;
+    esac
+    return 0
+}
+
+
+# --- Разбор аргументов -----------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)    usage; exit 0 ;;
+        -n|--dry-run) DRY_RUN=1 ;;
+        --install)    install_self; exit $? ;;
+        -*)
+            printf 'gsync: неизвестный ключ %s\n\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *) TARGETS+=("$1") ;;
+    esac
+    shift
+done
+
+[ ${#TARGETS[@]} -eq 0 ] && TARGETS=(".")
+
+# --- Один репозиторий ------------------------------------------------------
+
+sync_one() {
+    local dir="$1"
+    local name
+    name="$(basename "$(cd "$dir" && pwd)")"
+    TOTAL=$((TOTAL + 1))
+
+    printf '\n%s\n' "=== $name  ${C_DIM}($dir)${C_OFF}"
+
+    # Ветка. Отсоединённая голова — состояние, из которого новичок сам не
+    # выходит: git о нём сообщает многословно и неочевидно.
+    local branch
+    if ! branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null)"; then
+        err "HEAD отсоединён — вы не на ветке, и стягивать некуда"
+        hint "вернуться: git -C \"$dir\" switch main"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    # Свежие данные с удалённого. Это единственное обращение к сети и
+    # оно только читает: fetch не трогает ни рабочий каталог, ни ветку.
+    local fetch_log
+    if ! fetch_log="$(git -C "$dir" fetch --prune --quiet 2>&1)"; then
+        err "не удалось связаться с удалённым репозиторием"
+        [ -n "$fetch_log" ] && hint "$(printf '%s' "$fetch_log" | head -3)"
+        hint "если просит пароль — GitHub его не принимает с 2021 года,"
+        hint "нужен Personal Access Token вместо пароля"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    # Есть ли вообще за чем следить.
+    local upstream
+    if ! upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
+        warn "ветка «$branch» ни с чем не связана на удалённом"
+        hint "разово: git -C \"$dir\" config --global push.autoSetupRemote true"
+        hint "затем обычный git push привяжет её сам"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    # Незакоммиченные правки. Проверяются ДО любого действия: стянуть
+    # поверх них — как раз тот случай, ради которого скрипт и написан.
+    local dirty
+    dirty="$(git -C "$dir" status --porcelain)"
+
+    # Насколько разошлись. Формат: "<отстаём> <опережаем>".
+    local counts behind ahead
+    counts="$(git -C "$dir" rev-list --left-right --count "$upstream...HEAD" 2>/dev/null)" || counts="0	0"
+    behind="$(printf '%s' "$counts" | cut -f1)"
+    ahead="$(printf '%s' "$counts" | cut -f2)"
+
+    if [ -n "$dirty" ]; then
+        local changed
+        changed="$(printf '%s\n' "$dirty" | wc -l | tr -d ' ')"
+        warn "в каталоге $changed несохранённых изменений — не трогаю"
+        printf '%s\n' "$dirty" | head -10 | sed 's/^/      /'
+        [ "$changed" -gt 10 ] && hint "…и ещё $((changed - 10))"
+        if [ "$behind" -gt 0 ]; then
+            hint "сначала решите их судьбу: git -C \"$dir\" add -A && git commit"
+            hint "или уберите: git -C \"$dir\" restore <файл>"
+            hint "после этого gsync стянет $behind коммит(ов)"
+        fi
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    if [ "$behind" -eq 0 ] && [ "$ahead" -eq 0 ]; then
+        ok "«$branch» совпадает с $upstream — стягивать нечего"
+        return
+    fi
+
+    if [ "$behind" -eq 0 ] && [ "$ahead" -gt 0 ]; then
+        warn "«$branch» опережает $upstream на $ahead — не отправлено"
+        hint "отправить: git -C \"$dir\" push"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    if [ "$behind" -gt 0 ] && [ "$ahead" -gt 0 ]; then
+        err "ветки разошлись: у вас $ahead своих, на удалённом $behind чужих"
+        hint "слить историю, свои коммиты лягут сверху:"
+        hint "  git -C \"$dir\" pull --rebase"
+        hint "делать это вручную: при конфликте нужен человек,"
+        hint "а выход без потерь — git rebase --abort"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        return
+    fi
+
+    # Остался единственный безопасный случай: своих коммитов нет,
+    # дерево чистое, на удалённом есть новое. Перемотка вперёд.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        ok "можно перемотать вперёд на $behind коммит(ов) — режим --dry-run"
+        return
+    fi
+
+    local merge_log
+    if merge_log="$(git -C "$dir" merge --ff-only "$upstream" 2>&1)"; then
+        ok "перемотано вперёд на $behind коммит(ов)"
+        git -C "$dir" log --oneline "HEAD@{1}..HEAD" 2>/dev/null \
+            | head -5 | sed 's/^/      /'
+    else
+        err "перемотка не удалась"
+        [ -n "$merge_log" ] && hint "$(printf '%s' "$merge_log" | head -3)"
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+    fi
+}
+
+# --- Обход целей -----------------------------------------------------------
+
+is_repo() { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
+
+for target in "${TARGETS[@]}"; do
+    if [ ! -d "$target" ]; then
+        printf '%sgsync: каталога нет: %s%s\n' "$C_ERR" "$target" "$C_OFF" >&2
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+        continue
+    fi
+
+    if is_repo "$target"; then
+        sync_one "$target"
+        continue
+    fi
+
+    # Не репозиторий — значит каталог с репозиториями. Смотрим на один
+    # уровень вглубь: рекурсия по всему дереву нашла бы чужие
+    # репозитории внутри node_modules и подобного.
+    found=0
+    for sub in "$target"/*/; do
+        [ -d "$sub" ] || continue
+        if is_repo "$sub"; then
+            sync_one "${sub%/}"
+            found=$((found + 1))
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        printf '%sgsync: ни одного репозитория в %s%s\n' \
+            "$C_WARN" "$target" "$C_OFF" >&2
+        NEED_ATTENTION=$((NEED_ATTENTION + 1))
+    fi
+done
+
+# --- Итог ------------------------------------------------------------------
+
+printf '\n%s\n' "============================================================"
+if [ "$NEED_ATTENTION" -eq 0 ]; then
+    say "Репозиториев: $TOTAL. Все в порядке."
+    exit 0
+fi
+say "Репозиториев: $TOTAL, требуют внимания: $NEED_ATTENTION."
+say "Ничего не изменено там, где нужен ваш выбор, — см. подсказки выше."
+exit 1

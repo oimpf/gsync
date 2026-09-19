@@ -129,9 +129,9 @@ install_self() {
 
     # Описание едет рядом, если лежит рядом с исходником: второй ручной
     # mv — это второй шанс повторить ту же ошибку.
-    local doc="${src%/*}/gsync.md"
-    if [ -f "$doc" ] && [ "$doc" != "$target_dir/gsync.md" ]; then
-        cp -- "$doc" "$target_dir/gsync.md" && ok "описание рядом: $target_dir/gsync.md"
+    local doc="${src%/*}/README.md"
+    if [ -f "$doc" ] && [ "$doc" != "$target_dir/README.md" ]; then
+        cp -- "$doc" "$target_dir/README.md" && ok "описание рядом: $target_dir/README.md"
     fi
 
     say ""
